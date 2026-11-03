@@ -53,7 +53,7 @@ DEFAULTS = {
     "lmstudio_url": "http://127.0.0.1:1234/v1",
     "llm_model": "",
     "llm_temperature": 0.7,
-    "llm_max_tokens": 2048,
+    "llm_max_tokens": 8192,
     "send_images_to_llm": True,
     "unload_llm_before_generate": True,  # LLM + H3 together do not fit in 32 GB VRAM
     "blocks_to_swap": 16,

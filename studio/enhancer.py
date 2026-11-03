@@ -82,10 +82,13 @@ def enhance(
     idea: str,
     images: Iterable[str] = (),
     temperature: float = 0.7,
-    max_tokens: int = 2048,
+    max_tokens: int = 8192,
     on_token: Callable[[str], None] | None = None,
+    on_reasoning: Callable[[int], None] | None = None,
     should_stop: Callable[[], bool] | None = None,
 ) -> str:
+    """Stream a completion. Reasoning models first stream ``reasoning_content``;
+    ``on_reasoning`` gets the running character count of that phase."""
     content: list[dict] | str = idea
     images = list(images)
     if images:
@@ -109,19 +112,31 @@ def enhance(
         if r.status_code >= 400:
             raise EnhancerError(f"LM Studio error {r.status_code}: {r.text[:500]}")
         out = []
-        for raw in r.iter_lines(decode_unicode=True):
+        reasoning = 0
+        finish = None
+        # iterate raw bytes: decode_unicode=True would also split on U+2028 & co.,
+        # which may legally appear inside a JSON string and would corrupt the event
+        for raw_bytes in r.iter_lines():
             if should_stop and should_stop():
                 r.close()
                 break
-            if not raw or not raw.startswith("data:"):
+            raw = raw_bytes.decode("utf-8", "replace")
+            if not raw.startswith("data:"):
                 continue
             data = raw[5:].strip()
             if data == "[DONE]":
                 break
             try:
-                delta = json.loads(data)["choices"][0].get("delta", {})
+                choice = json.loads(data)["choices"][0]
             except (json.JSONDecodeError, KeyError, IndexError):
                 continue
+            finish = choice.get("finish_reason") or finish
+            delta = choice.get("delta", {})
+            thought = delta.get("reasoning_content") or delta.get("reasoning") or ""
+            if thought:
+                reasoning += len(thought)
+                if on_reasoning:
+                    on_reasoning(reasoning)
             piece = delta.get("content") or ""
             if piece:
                 out.append(piece)
@@ -129,4 +144,10 @@ def enhance(
                     on_token(piece)
     except requests.RequestException as e:
         raise EnhancerError(f"Connection to LM Studio failed: {e}") from e
-    return clean_output("".join(out))
+    text = clean_output("".join(out))
+    if not text and finish == "length" and not (should_stop and should_stop()):
+        raise EnhancerError(
+            f"{model} used all {max_tokens} tokens"
+            + (f" on reasoning ({reasoning} characters of thinking)" if reasoning else "")
+            + " before writing the prompt.\n\nRaise 'Max tokens' in Settings, or pick a non-reasoning model.")
+    return text

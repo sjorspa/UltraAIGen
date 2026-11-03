@@ -207,6 +207,7 @@ In a batch, every video loads the models again (about 1 minute). musubi's `--fro
 |---|---|
 | `CUDA out of memory` while loading | Another program holds VRAM, often an LLM in LM Studio. Keep *Unload the LLM before generating* enabled, or raise *DiT blocks to swap*. |
 | "LM Studio not reachable" | Start LM Studio's local server (Developer tab) and check the API URL in Settings. |
+| Enhancing seems to hang, or no prompt comes back | Reasoning models (such as Qwen3.5-based ones) think first. The status shows *💭 thinking… N chars* and then *✍ writing*. If a model spends all its tokens on thinking, you get a message; raise *Max tokens* in Settings (default 8192). After a generation the LLM was unloaded, so the first enhance also waits for LM Studio to load it again. |
 | The LLM ignores keyframes | Pick a model marked 👁 and enable *Send keyframes to the LLM*. |
 | A run fails | The **Log** panel shows the generator's full output. |
 

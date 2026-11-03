@@ -38,6 +38,7 @@ class FuncThread(QThread):
     done = Signal(object)
     failed = Signal(str)
     token = Signal(str)
+    reasoning = Signal(int)
 
     def __init__(self, fn, parent=None):
         super().__init__(parent)
@@ -564,18 +565,23 @@ class StudioTab(QWidget):
         def run(th: FuncThread):
             return enhancer.enhance(cfg["lmstudio_url"], model, system, idea, images,
                                     temperature=float(cfg["llm_temperature"]), max_tokens=int(cfg["llm_max_tokens"]),
-                                    on_token=th.token.emit, should_stop=lambda: th.stop_requested)
+                                    on_token=th.token.emit, on_reasoning=th.reasoning.emit,
+                                    should_stop=lambda: th.stop_requested)
 
         self.final.clear()
         self.enhance_btn.setText("■  Stop")
-        self.llm_status.setText(f"{model} is writing…")
+        self.llm_status.setText(f"Waiting for {model} (LM Studio loads it if needed)…")
         self.enhance_thread = FuncThread(run, self)
         self.enhance_thread.token.connect(self._on_token)
+        self.enhance_thread.reasoning.connect(
+            lambda n: self.llm_status.setText(f"💭 {model} is thinking… {n:,} chars"))
         self.enhance_thread.done.connect(lambda text: self._enhance_done(task, frames, text))
         self.enhance_thread.failed.connect(self._enhance_failed)
         self.enhance_thread.start()
 
     def _on_token(self, piece: str):
+        if not self.final.toPlainText():
+            self.llm_status.setText(f"✍ {self.llm_model.currentData()} is writing…")
         cur = self.final.textCursor()
         cur.movePosition(cur.MoveOperation.End)
         cur.insertText(piece)
