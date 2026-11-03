@@ -25,6 +25,7 @@ Works on **Linux and Windows**.
 - **Seed control and batches:**
   - Seed modes: fixed, random or increment.
   - Generate several videos per click. They run one after another, each with its own seed.
+- **System monitor.** Live CPU, RAM, VRAM and GPU usage, with a **Clear memory** button.
 - **Built-in player and history.** Every video is saved with a `.json` sidecar that holds the prompt and settings, and **Reuse prompt** restores them.
 - **Configurable paths.** You set every model path, the LoRA folder, the engine location and the output folder in the app.
 
@@ -126,6 +127,17 @@ Both scripts create the GUI's virtual environment on the first start (PySide6 + 
 5. **Generate video.** You see progress, the current step, the time left and the log. When the run ends, the video plays in the preview.
 
 ![Generating](docs/screenshots/02_generating.png)
+
+### System monitor
+
+The bar at the top right shows live **CPU**, **RAM**, **VRAM** and **GPU** usage. A bar turns orange at 75 % and red at 90 %.
+
+**🧹 Clear memory** frees GPU and system memory:
+
+- It unloads every model loaded in LM Studio.
+- It ends leftover generator processes, for example after a crash. It asks before ending anything.
+- It frees memory held by the app itself.
+- If a generation is running, it first asks whether to stop it.
 
 ### Video settings
 

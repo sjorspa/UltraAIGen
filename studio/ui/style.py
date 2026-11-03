@@ -91,5 +91,6 @@ QScrollBar:vertical {{ background: transparent; width: 10px; }}
 QScrollBar::handle:vertical {{ background: {BORDER}; border-radius: 5px; min-height: 30px; }}
 QScrollBar::add-line, QScrollBar::sub-line {{ height: 0; }}
 QSplitter::handle {{ background: transparent; }}
+QStatusBar {{ background: {PANEL}; color: {TEXT}; border-top: 1px solid {BORDER}; }}
 QToolTip {{ background: {PANEL_2}; color: {TEXT}; border: 1px solid {BORDER}; padding: 6px; }}
 """

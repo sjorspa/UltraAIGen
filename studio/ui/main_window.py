@@ -1,10 +1,13 @@
 """Top-level window: header + Studio / System prompts / Settings tabs."""
 
+from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import QHBoxLayout, QLabel, QMainWindow, QMessageBox, QTabWidget, QVBoxLayout, QWidget
 
+from .. import enhancer
+from . import system_monitor
 from .prompts_tab import PromptsTab
 from .settings_tab import SettingsTab
-from .studio_tab import StudioTab
+from .studio_tab import FuncThread, StudioTab
 
 
 class MainWindow(QMainWindow):
@@ -24,11 +27,14 @@ class MainWindow(QMainWindow):
         hl = QHBoxLayout(header)
         hl.setContentsMargins(20, 14, 20, 4)
         title = QLabel("◆ Ultra AI Generator", objectName="appTitle")
-        subtitle = QLabel("Native MiniMax-H3 video + audio  ·  prompt enhancement via LM Studio", objectName="appSubtitle")
+        subtitle = QLabel("MiniMax-H3 video + audio  ·  LM Studio", objectName="appSubtitle")
         hl.addWidget(title)
         hl.addSpacing(14)
         hl.addWidget(subtitle)
         hl.addStretch()
+        self.monitor = system_monitor.SystemMonitor()
+        self.monitor.clear_requested.connect(self.clear_memory)
+        hl.addWidget(self.monitor)
         lay.addWidget(header)
 
         self.tabs = QTabWidget()
@@ -50,6 +56,48 @@ class MainWindow(QMainWindow):
         self.studio.refresh_history()
         self.studio.refresh_models()
         self.statusBar().showMessage("Settings saved", 3000)
+
+    def clear_memory(self):
+        """Free VRAM/RAM: stop a running generation (after asking), end leftover
+        generator processes, unload LM Studio models and collect the GUI's garbage."""
+        studio = self.studio
+        if studio.is_busy():
+            if QMessageBox.question(self, "Clear memory",
+                                    "A generation is running. Stop it and clear memory?") != QMessageBox.Yes:
+                return
+            studio.stop()
+        current = studio.proc.processId() if studio.proc else None
+        orphans = system_monitor.find_orphan_generators(exclude_pid=current)
+        ended = 0
+        if orphans:
+            pids = ", ".join(str(p.pid) for p in orphans)
+            if QMessageBox.question(self, "Clear memory",
+                                    f"Found {len(orphans)} leftover generator process(es) (PID {pids}) "
+                                    "that may still hold GPU memory. End them?") == QMessageBox.Yes:
+                ended = system_monitor.kill_processes(orphans)
+        studio.player.stop()
+        system_monitor.collect_app_garbage()
+
+        self.monitor.clear_btn.setEnabled(False)
+        self.monitor.clear_btn.setText("Clearing…")
+        url = self.cfg["lmstudio_url"]
+        self._clear_thread = FuncThread(lambda _t: enhancer.unload_all(url), self)
+        self._clear_thread.done.connect(lambda unloaded: self._memory_cleared(unloaded, ended))
+        self._clear_thread.failed.connect(lambda _e: self._memory_cleared([], ended))
+        self._clear_thread.start()
+
+    def _memory_cleared(self, unloaded: list, ended: int):
+        self.monitor.clear_btn.setEnabled(True)
+        self.monitor.clear_btn.setText("🧹  Clear memory")
+        parts = []
+        if unloaded:
+            parts.append(f"unloaded {len(unloaded)} LM Studio model(s): {', '.join(unloaded)}")
+        if ended:
+            parts.append(f"ended {ended} generator process(es)")
+        self.statusBar().showMessage("Memory cleared — " + ("; ".join(parts) if parts else "nothing else was holding memory"), 8000)
+        if unloaded:
+            self.studio.refresh_models()  # the ● loaded markers changed
+        QTimer.singleShot(500, self.monitor.refresh)
 
     def closeEvent(self, e):
         if self.studio.is_busy():
