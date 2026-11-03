@@ -28,15 +28,8 @@ def _default_models_dir() -> str:
     return ""
 
 
-def _default_musubi_dir() -> str:
-    for candidate in (
-        Path.home() / "software" / "musubi-tuner",
-        APP_DIR.parent / "musubi-tuner",
-        Path("C:/musubi-tuner"),
-    ):
-        if candidate.is_dir():
-            return str(candidate)
-    return ""
+ENGINE_VENV = APP_DIR / ".engine-venv"
+_VENV_PYTHON = ("Scripts", "python.exe") if IS_WINDOWS else ("bin", "python")
 
 
 DEFAULTS = {
@@ -47,8 +40,8 @@ DEFAULTS = {
     "audio_vae": "vae/minimax_h3_audio_vae_fp32.safetensors",
     "lora_dir": "loras",
     "turbo_lora": "minimax_h3_turbo_v4_step600_ema.safetensors",  # relative to lora_dir
-    "musubi_dir": _default_musubi_dir(),
-    "musubi_python": "",  # empty = auto-detect the musubi venv
+    "engine_python": "",  # empty = auto-detect (see find_engine_python)
+    "keep_loaded": True,  # keep the transformer loaded between generations
     "output_dir": str(APP_DIR / "outputs"),
     "lmstudio_url": "http://127.0.0.1:1234/v1",
     "llm_model": "",
@@ -59,7 +52,6 @@ DEFAULTS = {
     "blocks_to_swap": 16,
     "text_encoder_blocks_to_swap": 0,
     "attn_mode": "sdpa",
-    "extra_args": "",
     "last": {},  # last used generation parameters, restored on start
 }
 
@@ -74,16 +66,21 @@ def resolve_model_path(cfg: dict, value: str) -> str:
     return str(p)
 
 
-def find_musubi_python(cfg: dict) -> str:
-    if cfg.get("musubi_python"):
-        return cfg["musubi_python"]
-    root = Path(cfg.get("musubi_dir") or "")
-    rel = ("Scripts", "python.exe") if IS_WINDOWS else ("bin", "python")
-    for venv in (".venv", "venv"):
-        candidate = root.joinpath(venv, *rel)
-        if candidate.is_file():
-            return str(candidate)
-    return sys.executable
+def find_engine_python(cfg: dict) -> str:
+    """The Python that runs the engine: it needs PyTorch, transformers, av and friends.
+
+    Order: the configured path, the app's own .engine-venv, then the venv of an existing
+    musubi-tuner checkout (only its Python environment is used, not its code).
+    """
+    if cfg.get("engine_python"):
+        return cfg["engine_python"]
+    candidates = [ENGINE_VENV.joinpath(*_VENV_PYTHON)]
+    if cfg.get("musubi_python"):  # setting from older versions
+        candidates.append(Path(cfg["musubi_python"]))
+    for root in (cfg.get("musubi_dir"), Path.home() / "software" / "musubi-tuner", APP_DIR.parent / "musubi-tuner"):
+        if root:
+            candidates += [Path(root).joinpath(v, *_VENV_PYTHON) for v in (".venv", "venv")]
+    return next((str(c) for c in candidates if c.is_file()), "")
 
 
 def load_config() -> dict:

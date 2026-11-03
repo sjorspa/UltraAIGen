@@ -1,0 +1,15 @@
+# Python packages for the MiniMax-H3 engine (studio/engine). Python 3.10–3.12.
+# Versions match the environment the engine was validated with (bit-identical to musubi-tuner).
+--extra-index-url https://download.pytorch.org/whl/cu128
+torch==2.11.0
+torchvision==0.26.0
+transformers==4.57.6
+accelerate==1.6.0
+safetensors>=0.4.5
+av==14.0.1
+numpy>=1.26
+pillow>=11.0
+opencv-python-headless>=4.10
+tqdm>=4.66
+# INT8 kernels: triton ships with torch on Linux; Windows needs the community build
+triton-windows; sys_platform == "win32"

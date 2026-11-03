@@ -65,9 +65,12 @@ class MainWindow(QMainWindow):
             if QMessageBox.question(self, "Clear memory",
                                     "A generation is running. Stop it and clear memory?") != QMessageBox.Yes:
                 return
-            studio.stop()
-        current = studio.proc.processId() if studio.proc else None
-        orphans = system_monitor.find_orphan_generators(exclude_pid=current)
+            studio.stopped = True
+            studio.engine.kill()
+        # quitting the engine frees every model it keeps loaded; it restarts on the next generation
+        engine_was_running = studio.engine.is_running()
+        studio.shutdown_engine()
+        orphans = system_monitor.find_orphan_generators()
         ended = 0
         if orphans:
             pids = ", ".join(str(p.pid) for p in orphans)
@@ -82,14 +85,14 @@ class MainWindow(QMainWindow):
         self.monitor.clear_btn.setText("Clearing…")
         url = self.cfg["lmstudio_url"]
         self._clear_thread = FuncThread(lambda _t: enhancer.unload_all(url), self)
-        self._clear_thread.done.connect(lambda unloaded: self._memory_cleared(unloaded, ended))
-        self._clear_thread.failed.connect(lambda _e: self._memory_cleared([], ended))
+        self._clear_thread.done.connect(lambda unloaded: self._memory_cleared(unloaded, ended, engine_was_running))
+        self._clear_thread.failed.connect(lambda _e: self._memory_cleared([], ended, engine_was_running))
         self._clear_thread.start()
 
-    def _memory_cleared(self, unloaded: list, ended: int):
+    def _memory_cleared(self, unloaded: list, ended: int, engine_stopped: bool):
         self.monitor.clear_btn.setEnabled(True)
         self.monitor.clear_btn.setText("🧹  Clear memory")
-        parts = []
+        parts = ["unloaded the H3 models"] if engine_stopped else []
         if unloaded:
             parts.append(f"unloaded {len(unloaded)} LM Studio model(s): {', '.join(unloaded)}")
         if ended:
@@ -104,6 +107,7 @@ class MainWindow(QMainWindow):
             if QMessageBox.question(self, "Busy", "A generation is running. Stop it and quit?") != QMessageBox.Yes:
                 e.ignore()
                 return
-            self.studio.stop()
+            self.studio.stopped = True
+        self.studio.shutdown_engine()
         self.studio.save_last()
         e.accept()

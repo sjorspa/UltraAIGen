@@ -1,0 +1,27 @@
+h3core — MiniMax-H3 inference code vendored into Ultra AI Generator
+
+Source: Musubi Tuner by kohya-ss, https://github.com/kohya-ss/musubi-tuner
+        commit db61a08 (Merge pull request #1106 "h3-cleanup-trainer-seam")
+License: Apache License 2.0 (see LICENSE). Individual files keep their original
+         copyright and license headers.
+
+Upstream attribution (from the Musubi Tuner README):
+- MiniMax-H3 transformer, video VAE, packing, text presentation and scheduler
+  are adapted from Diffusers PR #14355 (Copyright The MiniMax Team and
+  The HuggingFace Team, Apache-2.0).
+- wan/ is modified from Wan2.1 (Apache-2.0).
+- modules/convrot_int8_kernels.py is modified from comfy-kitchen (Apache-2.0).
+- Other Musubi Tuner code is Apache-2.0; some is copied and modified from Diffusers.
+
+Modifications made for Ultra AI Generator:
+- Only the modules needed for MiniMax-H3 inference are included; training,
+  dataset caching, other model architectures and the generation CLI are not.
+- The package is renamed from `musubi_tuner` to `h3core` (imports rewritten)
+  so it cannot collide with an installed musubi-tuner.
+- minimax_h3/media.py: removed the unused import of the dataset
+  ContentDatasource and turned its one type annotation (in a training-only
+  helper) into a plain string.
+- networks/lora_minimax_h3.py: LoRA target modules include "RefinerBlock"
+  besides "DiTBlock", so LoRAs that adapt the text-token refiner (such as the
+  H3 turbo LoRA) load completely. Training defaults are unaffected because the
+  default target pattern only matches the main DiT blocks.

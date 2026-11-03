@@ -7,7 +7,7 @@ import re
 import time
 from pathlib import Path
 
-from PySide6.QtCore import QElapsedTimer, QProcess, QProcessEnvironment, Qt, QThread, QTimer, QUrl, Signal
+from PySide6.QtCore import QElapsedTimer, Qt, QThread, QTimer, QUrl, Signal
 from PySide6.QtGui import QDesktopServices, QFont, QImageReader, QPixmap
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer, QVideoSink
 from PySide6.QtWidgets import (
@@ -17,7 +17,8 @@ from PySide6.QtWidgets import (
 )
 
 from .. import backend, enhancer
-from ..config import resolve_model_path, save_config
+from ..engine_client import EngineClient
+from ..config import find_engine_python, resolve_model_path, save_config
 from ..presets import TASKS, build_final_prompt, duration_str, fill_placeholders, load_presets
 from .widgets import ImageDrop, card
 
@@ -57,10 +58,18 @@ class StudioTab(QWidget):
         super().__init__(parent)
         self.cfg = cfg
         self.presets = load_presets()
-        self.proc: QProcess | None = None
+        self.engine = EngineClient(self)
+        self.engine.status.connect(self._engine_status)
+        self.engine.progress.connect(self._engine_progress)
+        self.engine.done.connect(self._job_done)
+        self.engine.failed.connect(self._job_failed)
+        self.engine.cancelled.connect(self._job_cancelled)
+        self.engine.log.connect(self._engine_log)
+        self.engine.exited.connect(self._engine_exited)
+        self.engine.ready.connect(lambda ev: self.log.appendPlainText(f"Engine ready on {ev.get('gpu') or ev.get('device')}"))
+        self.running = False
         self.jobs: list[backend.Job] = []
         self.job_meta: dict = {}
-        self.out_buffer = ""
         self.done_paths: list[str] = []
         self.enhance_thread: FuncThread | None = None
         self.models_thread: FuncThread | None = None
@@ -605,7 +614,7 @@ class StudioTab(QWidget):
 
     # ------------------------------------------------------------------ generate
     def generate(self):
-        if self.proc:
+        if self.running:
             return
         problems = backend.check_setup(self.cfg)
         if problems:
@@ -647,14 +656,6 @@ class StudioTab(QWidget):
                          "width": self.width_spin.value(), "height": self.height_spin.value(), "frame_count": frames,
                          "steps": steps, "loras": loras, "first_frame": self.first_drop.path,
                          "last_frame": self.last_drop.path, "dit": self.cfg["dit"]}
-        try:
-            if loras:
-                self.status.setText("Preparing LoRA…")
-                self.repaint()
-            backend.build_command(self.cfg, self.jobs[0])
-        except (backend.BackendError, OSError) as e:
-            QMessageBox.warning(self, "Generate", str(e))
-            return
         if mode == "increment":
             self.seed.setValue((seeds[-1] + 1) % 2**31)
         self.save_last()
@@ -670,115 +671,102 @@ class StudioTab(QWidget):
         self.log.clear()
         self.job_index = 0
         self.stopped = False
+        self.running = True
         self.done_paths = []
+        self.last_error = ""
         self.gen_btn.setEnabled(False)
         self.stop_btn.setEnabled(True)
         self.timer.start()
         self.tick.start()
+        if not self.engine.is_running():
+            self.phase = "Starting engine…"
+            self.engine.start(find_engine_python(self.cfg))
         self._start_job()
 
     def _start_job(self):
-        """Run the current job in its own process; _finished starts the next one."""
+        """Send the current job to the engine; the done/failed handlers start the next one."""
         job = self.jobs[self.job_index]
-        try:
-            program, args, cwd = backend.build_command(self.cfg, job)
-        except (backend.BackendError, OSError) as e:
-            self.log.appendPlainText(str(e))
-            self._end_queue()
-            return
-        n = len(self.jobs)
-        header = f"=== Video {self.job_index + 1}/{n} · seed {job.seed} ===\n" if n > 1 else ""
-        self.log.appendPlainText(header + "$ " + " ".join(
-            [program] + [a if len(a) < 120 else a[:117] + "…" for a in args]) + "\n")
-        self.proc = QProcess(self)
-        env = QProcessEnvironment.systemEnvironment()
-        env.insert("PYTHONUNBUFFERED", "1")
-        env.insert("PYTHONIOENCODING", "utf-8")
-        self.proc.setProcessEnvironment(env)
-        self.proc.setWorkingDirectory(cwd)
-        self.proc.setProcessChannelMode(QProcess.MergedChannels)
-        self.proc.readyReadStandardOutput.connect(self._read_output)
-        self.proc.finished.connect(self._finished)
-        self.proc.errorOccurred.connect(self._proc_error)
-        self.out_buffer = ""
-        self.phase = self._video_prefix() + "Loading models…"
+        if len(self.jobs) > 1:
+            self.log.appendPlainText(f"=== Video {self.job_index + 1}/{len(self.jobs)} · seed {job.seed} ===")
+        self.phase = self._video_prefix() + "Preparing…"
         self.progress.setRange(0, 0)
         self._update_elapsed()
-        self.proc.start(program, args)
+        self.engine.generate(str(self.job_index), backend.engine_config(self.cfg), job.to_dict())
 
     def _video_prefix(self) -> str:
         n = len(self.jobs)
         return f"Video {self.job_index + 1}/{n} · " if n > 1 else ""
 
-    def _read_output(self):
-        self.out_buffer += bytes(self.proc.readAllStandardOutput()).decode("utf-8", "replace")
-        parts = re.split(r"[\r\n]", self.out_buffer)
-        self.out_buffer = parts.pop()
-        for line in parts:
-            self._handle_line(line)
-
-    def _handle_line(self, line: str):
-        line = line.rstrip()
-        if not line:
-            return
-        m = _TQDM_RE.search(line)
-        if m:
-            pct, step, total, timing = m.groups()
-            step, total = int(step), int(total)
-            n = len(self.jobs)
-            self.progress.setRange(0, 100)
-            self.progress.setValue(int((self.job_index * total + step) * 100 / (n * total)))
-            eta = timing.split("<")[-1].split(",")[0] if "<" in timing else ""
-            self.phase = f"{self._video_prefix()}Sampling step {step}/{total}" + (f" · {eta} left" if eta else "")
-            self._update_elapsed()
-            return
-        if "INFO" in line:
-            msg = line.split(":", 2)[-1].strip()
-            low = msg.lower()
-            if "loading" in low or "encoding" in low or "decoding" in low:
-                self.phase = self._video_prefix() + msg.replace("MiniMax-H3 ", "") + "…"
-                if "decoding" in low:
-                    self.progress.setRange(0, 0)
-                self._update_elapsed()
-        # gcc/triton header noise is not useful in the log
-        if not re.search(r"pyconfig\.h|_POSIX_C_SOURCE|features\.h|__triton_launcher|^\s*\||^\s*\d+ \|", line):
+    def _engine_log(self, line: str):
+        # gcc/triton header noise from kernel compilation is not useful in the log
+        if not re.search(r"pyconfig\.h|_POSIX_C_SOURCE|features\.h|__triton_launcher|^\s*\||^\s*\d+ \||^\s*\^", line):
             self.log.appendPlainText(line)
 
+    def _engine_status(self, msg: str):
+        if not self.running:
+            return
+        self.phase = self._video_prefix() + msg
+        if msg.startswith("Decoding"):
+            self.progress.setRange(0, 0)
+        self._update_elapsed()
+
+    def _engine_progress(self, step: int, total: int):
+        if not self.running:
+            return
+        n = len(self.jobs)
+        self.progress.setRange(0, 100)
+        self.progress.setValue(int((self.job_index * total + step) * 100 / (n * total)))
+        self.phase = f"{self._video_prefix()}Sampling step {step}/{total}"
+        self._update_elapsed()
+
     def _update_elapsed(self):
-        if self.proc:
+        if self.running:
             s = self.timer.elapsed() // 1000
             self.status.setText(f"{self.phase}   ·   {s // 60}:{s % 60:02d} elapsed")
 
     def stop(self):
-        if self.proc:
+        if self.running and not self.stopped:
             self.stopped = True
-            self.phase = "Stopping…"
-            self.proc.kill()
+            self.phase = "Stopping after the current step…"
+            self._update_elapsed()
+            self.engine.cancel()
 
-    def _proc_error(self, err):
-        if err == QProcess.FailedToStart:
-            self.log.appendPlainText(f"Could not start process: {self.proc.errorString()}")
-
-    def _finished(self, code: int, _status):
-        if self.out_buffer:
-            self._handle_line(self.out_buffer)
-        self.proc.deleteLater()
-        self.proc = None
+    def _job_done(self, _job_id: str, path: str, seconds: int):
         job = self.jobs[self.job_index]
-        out = Path(job.output_path)
-        if code == 0 and out.is_file():
-            meta = dict(self.job_meta, seed=job.seed, seconds=self.timer.elapsed() // 1000)
+        out = Path(path)
+        if out.is_file():
+            meta = dict(self.job_meta, seed=job.seed, seconds=seconds)
             out.with_suffix(".json").write_text(json.dumps(meta, indent=2, ensure_ascii=False), encoding="utf-8")
             self.done_paths.append(str(out))
+            self.log.appendPlainText(f"Saved {out.name} ({seconds} s)")
             self.refresh_history(select=str(out))
             self.play(str(out))
+        self._next_job()
+
+    def _job_failed(self, _job_id: str, msg: str):
+        self.last_error = msg
+        self.log.appendPlainText(f"ERROR: {msg}")
+        self._next_job()
+
+    def _job_cancelled(self, _job_id: str):
+        self.log.appendPlainText("Cancelled.")
+        self._end_queue()
+
+    def _next_job(self):
         self.job_index += 1
-        if not self.stopped and self.job_index < len(self.jobs):
+        if self.running and not self.stopped and self.job_index < len(self.jobs):
             self._start_job()
         else:
-            self._end_queue(code)
+            self._end_queue()
 
-    def _end_queue(self, code: int = 1):
+    def _engine_exited(self, code: int):
+        if self.running:
+            self.last_error = f"The engine stopped unexpectedly (exit code {code}). See the log."
+            self.log.appendPlainText(self.last_error)
+            self._end_queue()
+
+    def _end_queue(self):
+        self.running = False
         self.tick.stop()
         self.gen_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)
@@ -794,7 +782,12 @@ class StudioTab(QWidget):
             self.status.setText(f"✓ Done in {t}  ·  {label}{extra}")
         else:
             self.progress.setValue(0)
-            self.status.setText(f"✕ Stopped or failed (exit code {code}) after {t}. See the log.")
+            reason = "Stopped" if self.stopped else (self.last_error or "Failed")
+            self.status.setText(f"✕ {reason} after {t}.")
+
+    def shutdown_engine(self):
+        """Quit the engine process, which frees all GPU and model memory it holds."""
+        self.engine.shutdown()
 
     # ------------------------------------------------------------------ preview / history
     def play(self, path: str):
@@ -846,7 +839,7 @@ class StudioTab(QWidget):
             self.history.setCurrentItem(sel)
 
     def _history_selected(self, item, _prev=None):
-        if item and not self.proc:
+        if item and not self.running:
             self.play(item.data(Qt.UserRole)[0])
 
     def _reuse_history(self):
@@ -873,4 +866,4 @@ class StudioTab(QWidget):
         self.last_drop.set_path(meta.get("last_frame", ""))
 
     def is_busy(self) -> bool:
-        return self.proc is not None
+        return self.running

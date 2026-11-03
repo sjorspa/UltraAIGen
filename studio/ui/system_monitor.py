@@ -2,6 +2,7 @@
 
 import gc
 import os
+from pathlib import Path
 
 from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtWidgets import QFrame, QHBoxLayout, QLabel, QProgressBar, QPushButton, QVBoxLayout, QWidget
@@ -21,7 +22,13 @@ except Exception:
     pynvml = None
     _GPU = None
 
-GENERATOR_MARKER = "run_h3.py"  # every generation process is started through this launcher
+def _is_generator(cmdline: list[str]) -> bool:
+    """The engine worker (studio/engine/worker.py) or an older per-video launcher."""
+    for part in cmdline:
+        p = Path(part)
+        if (p.name == "worker.py" and p.parent.name == "engine") or p.name == "run_h3.py":
+            return True
+    return False
 
 
 def _gb(n: int) -> str:
@@ -116,14 +123,14 @@ class SystemMonitor(QFrame):
 
 
 def find_orphan_generators(exclude_pid: int | None = None) -> list:
-    """Generator processes that are not the app's current run (e.g. left by a crash)."""
+    """Engine processes that do not belong to this app instance (e.g. left by a crash)."""
     if not psutil:
         return []
     found = []
     for proc in psutil.process_iter(["pid", "cmdline"]):
         try:
             cmd = proc.info["cmdline"] or []
-            if proc.pid not in (exclude_pid, os.getpid()) and any(GENERATOR_MARKER in part for part in cmd):
+            if proc.pid not in (exclude_pid, os.getpid()) and _is_generator(cmd):
                 found.append(proc)
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             continue

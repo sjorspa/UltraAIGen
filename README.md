@@ -10,7 +10,8 @@ Works on **Linux and Windows**.
 
 ## Features
 
-- **Native generation.** The MiniMax-H3 implementation of [musubi-tuner](https://github.com/kohya-ss/musubi-tuner) does the generation in pure PyTorch. It loads your existing model files directly, including the ConvRot INT8 transformer and the NVFP4 text encoder.
+- **Built-in native engine.** A MiniMax-H3 engine in pure PyTorch ships with the app (`studio/engine`, adapted from [musubi-tuner](https://github.com/kohya-ss/musubi-tuner)). It loads your existing model files directly, including the ConvRot INT8 transformer and the NVFP4 text encoder. Its output is bit-identical to musubi-tuner's.
+- **Models stay loaded.** After the first video, the next one starts without reloading the models. A new seed for the same prompt also skips the text encoder.
 - **Four modes:**
   - text → video
   - first frame → video
@@ -24,7 +25,7 @@ Works on **Linux and Windows**.
 - **Turbo LoRA.** One switch, with 4, 6 or 8 steps.
 - **Seed control and batches:**
   - Seed modes: fixed, random or increment.
-  - Generate several videos per click. They run one after another, each with its own seed.
+  - Generate several videos per click. They run one after another on the loaded models, each with its own seed.
 - **System monitor.** Live CPU, RAM, VRAM and GPU usage, with a **Clear memory** button.
 - **Built-in player and history.** Every video is saved with a `.json` sidecar that holds the prompt and settings, and **Reuse prompt** restores them.
 - **Configurable paths.** You set every model path, the LoRA folder, the engine location and the output folder in the app.
@@ -34,14 +35,14 @@ Works on **Linux and Windows**.
 ## How it works
 
 ```
- your idea ──► LM Studio (system prompt preset) ──► H3 prompt ──► musubi-tuner (native PyTorch) ──► .mp4 (video + audio)
+ your idea ──► LM Studio (system prompt preset) ──► H3 prompt ──► built-in H3 engine (PyTorch) ──► .mp4 (video + audio)
 ```
 
 1. You write a short idea, in any language.
 2. The LLM rewrites it into the three fields H3 is trained on: `integrated_multimodal_description`, `overall_soundscape` and `non_diegetic_music`.
 3. For keyframe modes, the app adds the official alignment instruction line itself, with the correct duration and shot number. The LLM never has to get this right.
 4. The app unloads the LLM from VRAM, because the LLM and H3 do not fit together on a 32 GB GPU.
-5. The app runs musubi-tuner's H3 generator as a separate process. The interface stays responsive, and all VRAM is released when the run ends.
+5. The app sends the job to its engine, a separate Python process that keeps the models loaded between jobs. The interface stays responsive, and **Clear memory** stops the engine to release all of its memory.
 
 ---
 
@@ -51,7 +52,7 @@ Works on **Linux and Windows**.
 |---|---|
 | GPU | NVIDIA with CUDA. Tested on an RTX 5090 (32 GB). Smaller GPUs work with more block swapping (see [Settings](#settings)). |
 | RAM | 64 GB recommended. |
-| Python | 3.10 or newer for the GUI. musubi-tuner has its own venv. |
+| Python | 3.10–3.12 for the engine (PyTorch). The GUI runs on 3.10 or newer. |
 | LM Studio | Optional. Needed only for prompt enhancement. |
 
 ### Model files
@@ -72,41 +73,28 @@ Other variants work too: the full or pruned BF16 transformer, and the BF16 or IN
 
 ## Installation
 
-### 1. Generation engine (musubi-tuner)
+### 1. Engine environment
 
-**Linux**
+The engine needs PyTorch with CUDA. One script creates its environment in `.engine-venv` (a download of a few GB):
 
-```bash
-git clone https://github.com/kohya-ss/musubi-tuner.git
-cd musubi-tuner
-python3 -m venv .venv
-.venv/bin/pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
-.venv/bin/pip install -e .
-```
+- **Linux:** `./setup_engine.sh`
+- **Windows:** double-click `setup_engine.bat`
 
-**Windows (PowerShell)**
+The versions are pinned in `requirements-engine.txt`. On Windows, the script also installs `triton-windows` for the fast INT8 kernels.
 
-```powershell
-git clone https://github.com/kohya-ss/musubi-tuner.git
-cd musubi-tuner
-python -m venv .venv
-.venv\Scripts\pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
-.venv\Scripts\pip install -e .
-```
-
-On the first run, musubi downloads a few small tokenizer and config files from Hugging Face. It downloads no weights.
+On the first generation, the engine downloads a few small tokenizer and config files from Hugging Face. It downloads no weights.
 
 ### 2. Ultra AI Generator
 
 - **Linux:** `./run.sh`
 - **Windows:** double-click `run.bat`
 
-Both scripts create the GUI's virtual environment on the first start (PySide6 + requests) and then open the app.
+Both scripts create the GUI's virtual environment on the first start (PySide6, requests, psutil and nvidia-ml-py) and then open the app.
 
 ### 3. First start
 
 1. Open the **Settings** tab.
-2. Check the **Models folder** and the **musubi-tuner folder**. The app looks for `~/software/ComfyUI/models` and `~/software/musubi-tuner` automatically.
+2. Check the **Models folder**. The app looks for `~/software/ComfyUI/models` automatically. It finds the engine environment from step 1 by itself.
 3. Click **Check setup**. The app reports anything it cannot find.
 4. Click **Save**.
 
@@ -135,7 +123,8 @@ The bar at the top right shows live **CPU**, **RAM**, **VRAM** and **GPU** usage
 **🧹 Clear memory** frees GPU and system memory:
 
 - It unloads every model loaded in LM Studio.
-- It ends leftover generator processes, for example after a crash. It asks before ending anything.
+- It stops the H3 engine, which releases the models it keeps loaded. The engine starts again on the next generation.
+- It ends leftover engine processes, for example after a crash. It asks before ending anything.
 - It frees memory held by the app itself.
 - If a generation is running, it first asks whether to stop it.
 
@@ -150,7 +139,7 @@ The bar at the top right shows live **CPU**, **RAM**, **VRAM** and **GPU** usage
 | **Turbo** | Uses the turbo LoRA with **4, 6 or 8 steps**, instead of the normal step count of about 20–30. |
 | **Steps** | Number of model evaluations without turbo. |
 | **Seed** | **Fixed** uses this seed; several videos get seed, seed+1, and so on. **Random** gives each video a new seed. **Increment** works like fixed, then moves the seed on for the next click. |
-| **Count** | Number of videos per click. Each video runs as its own process, one after another. |
+| **Count** | Number of videos per click. They run one after another on the loaded models. |
 | **LoRA 1/2** | Extra LoRAs from the LoRA folder, each with a strength. |
 
 ### History
@@ -182,11 +171,11 @@ The LLM writes only the three H3 fields. The app adds the keyframe instruction l
 |---|---|
 | Models folder and model paths | Paths can be absolute or relative to the models folder. |
 | LoRA folder / Turbo LoRA | The turbo LoRA path is relative to the LoRA folder. |
-| musubi-tuner folder / Python | Leave Python empty to use `.venv` or `venv` inside the musubi folder. |
+| Engine Python | Leave empty to find it automatically: first `.engine-venv`, then the venv of an existing musubi-tuner checkout (only its Python environment is used). |
+| Keep models loaded | On by default. The transformer stays loaded between generations; the text encoder and VAEs wait in RAM. Uses about 30 GB of RAM. Turn it off to free all memory after every video. |
 | DiT blocks to swap | The number of the 50 transformer blocks that are streamed from RAM. `16` is good for 32 GB. Use more for smaller GPUs, up to 48. |
 | Text encoder blocks to swap | `0` on 32 GB. `50` for GPUs with 24 GB or less. |
 | Attention | `sdpa` (default), or `flash`, `sageattn` and so on if they are installed. |
-| Extra arguments | Passed straight to the generator, for example `--compile`. |
 | LM Studio | API URL, temperature, max tokens, *send keyframes to the LLM*, *unload the LLM before generating*. |
 
 All settings are stored in `config.json`, and the presets in `system_prompts.json`.
@@ -195,21 +184,23 @@ All settings are stored in `config.json`, and the presets in `system_prompts.jso
 
 ## Performance
 
-These figures were measured on an RTX 5090 with 16 DiT blocks swapped. Model loading is included.
+These figures were measured on an RTX 5090 with 16 DiT blocks swapped.
 
 | Run | Time |
 |---|---|
-| 960×544, 5 s, 20 steps | ~3 min 25 s |
-| 960×544, 5 s, turbo LoRA, 8 steps | ~2 min |
+| 960×544, 5 s, 20 steps, first video (includes loading) | ~3 min 25 s |
+| 960×544, 5 s, turbo LoRA, 8 steps, first video | ~2 min |
+| 672×384, 2 s, turbo LoRA, 4 steps, first video | ~50 s |
+| Same, next video with models loaded (new seed) | **~15 s** |
 
-In a batch, every video loads the models again (about 1 minute). musubi's `--from_file` batch mode would load them only once, but with block swap enabled it fails from the second prompt onward, so the app does not use it.
+With models loaded, the next video skips loading the transformer (about 12 s). If the prompt is unchanged, it also skips the text encoder (about 20 s).
 
 ---
 
 ## Notes and limitations
 
 - **Turbo LoRA on a pruned transformer.** The turbo LoRA was trained on the full transformer. The *pruned* transformer replaces the time embedding with an 8-wide lookup table, and the file does not store the projection needed to convert the LoRA's AdaLN deltas. When the selected DiT is pruned, the app therefore drops those deltas and applies the attention, MLP and token-refiner deltas. In testing this gave sharp, coherent results in 8 steps. To apply the LoRA completely, select a full (non-pruned) transformer.
-- **PEFT-style LoRAs** (`lora_A`/`lora_B`) are converted once to musubi's format and cached in `cache/loras/`.
+- **LoRA formats.** The engine reads both musubi-style (`lora_unet_*`) and PEFT-style (`lora_A`/`lora_B`) LoRAs. It attaches them at runtime, including deltas for the text-token refiner blocks, and skips layers that do not exist in the selected transformer. The log shows how many were attached and how many skipped.
 - **No negative prompt and no CFG.** The released H3 weights are guidance-distilled.
 - **Reference-to-video (Ref2VA)** needs the separate Ref2VA transformer and is not in the GUI yet.
 
@@ -221,20 +212,29 @@ In a batch, every video loads the models again (about 1 minute). musubi's `--fro
 | "LM Studio not reachable" | Start LM Studio's local server (Developer tab) and check the API URL in Settings. |
 | Enhancing seems to hang, or no prompt comes back | Reasoning models (such as Qwen3.5-based ones) think first. The status shows *💭 thinking… N chars* and then *✍ writing*. If a model spends all its tokens on thinking, you get a message; raise *Max tokens* in Settings (default 8192). After a generation the LLM was unloaded, so the first enhance also waits for LM Studio to load it again. |
 | The LLM ignores keyframes | Pick a model marked 👁 and enable *Send keyframes to the LLM*. |
-| A run fails | The **Log** panel shows the generator's full output. |
+| A run fails | The **Log** panel shows the engine's full output. |
+| "Engine Python not found" | Run `setup_engine.sh` or `setup_engine.bat`, or point *Engine Python* in Settings at a Python environment with PyTorch. |
 
 ## Project layout
 
 ```
-minimax_studio.py        entry point
-run.sh / run.bat         launchers (create the GUI venv on first run)
+minimax_studio.py          entry point
+run.sh / run.bat           start the GUI (create its venv on first run)
+setup_engine.sh / .bat     create the engine environment (.engine-venv)
+requirements.txt           GUI packages
+requirements-engine.txt    engine packages (PyTorch and friends)
 studio/
-  config.py              settings and path resolution
-  presets.py             default system prompts and H3 prompt assembly
-  enhancer.py            LM Studio client (model list, streaming, unload)
-  backend.py             builds the native generation command
-  tools/convert_lora.py  PEFT → musubi LoRA conversion (runs in the musubi venv)
-  tools/run_h3.py        launches the generator with token-refiner LoRA support
-  ui/                    PySide6 interface
-docs/screenshots/        images used in this README
+  config.py                settings and path resolution
+  presets.py               default system prompts and H3 prompt assembly
+  enhancer.py              LM Studio client (model list, streaming, unload)
+  backend.py               generation jobs, H3 canvas and duration rules
+  engine_client.py         GUI side of the engine (JSON lines over stdin/stdout)
+  engine/worker.py         the engine process: loads models, runs jobs, keeps models loaded
+  engine/h3core/           MiniMax-H3 model code adapted from musubi-tuner (Apache-2.0, see NOTICE)
+  ui/                      PySide6 interface
+docs/screenshots/          images used in this README
 ```
+
+## Credits and licenses
+
+The engine code in `studio/engine/h3core` comes from [Musubi Tuner](https://github.com/kohya-ss/musubi-tuner) by kohya-ss, commit `db61a08`. That code in turn builds on the MiniMax-H3 support in Diffusers. It is licensed under the Apache License 2.0. `studio/engine/h3core/NOTICE` lists its origin and the changes made, and `studio/engine/h3core/LICENSE` holds the license text. The MiniMax-H3 weights are covered by the [MiniMax-H3 Community License](https://huggingface.co/MiniMaxAI/MiniMax-H3/blob/main/LICENSE).

@@ -7,7 +7,7 @@ from PySide6.QtWidgets import (
 )
 
 from .. import backend
-from ..config import resolve_model_path, save_config
+from ..config import find_engine_python, resolve_model_path, save_config
 from .widgets import PathField, card
 
 SAFETENSORS = "Safetensors (*.safetensors)"
@@ -60,14 +60,15 @@ class SettingsTab(QWidget):
 
         # --- backend
         c, cl = card("Generation engine (native PyTorch)")
-        hint = QLabel("Videos are generated locally with the native MiniMax-H3 implementation of musubi-tuner "
-                      "(no ComfyUI). Leave 'Python' empty to use the venv inside the musubi folder automatically.")
+        hint = QLabel("Videos are generated locally by the built-in MiniMax-H3 engine (PyTorch, no ComfyUI). "
+                      "Leave 'Engine Python' empty to detect a Python environment with PyTorch automatically.")
         hint.setObjectName("hint")
         hint.setWordWrap(True)
         cl.addWidget(hint)
         f = QFormLayout()
-        self.musubi_dir = PathField("dir")
-        self.musubi_python = PathField("file")
+        self.engine_python = PathField("file")
+        self.engine_python.edit.setPlaceholderText("auto")
+        self.keep_loaded = QCheckBox("Keep models loaded between generations (much faster repeats; uses ~30 GB RAM)")
         self.output_dir = PathField("dir")
         self.blocks_to_swap = QSpinBox(minimum=0, maximum=48)
         self.blocks_to_swap.setToolTip("How many of the 50 DiT blocks stay in RAM and are streamed to the GPU each step. "
@@ -76,15 +77,12 @@ class SettingsTab(QWidget):
         self.te_blocks_to_swap.setToolTip("Stream text-encoder layers from RAM (50 for GPUs with ≤24 GB).")
         self.attn_mode = QComboBox()
         self.attn_mode.addItems(["sdpa", "torch", "flash", "flash3", "sageattn", "xformers"])
-        self.extra_args = QLineEdit()
-        self.extra_args.setPlaceholderText("e.g. --compile")
-        f.addRow("musubi-tuner folder", self.musubi_dir)
-        f.addRow("Python (optional)", self.musubi_python)
+        f.addRow("Engine Python", self.engine_python)
+        f.addRow("", self.keep_loaded)
         f.addRow("Output folder", self.output_dir)
         f.addRow("DiT blocks to swap", self.blocks_to_swap)
         f.addRow("Text encoder blocks to swap", self.te_blocks_to_swap)
         f.addRow("Attention", self.attn_mode)
-        f.addRow("Extra arguments", self.extra_args)
         cl.addLayout(f)
         lay.addWidget(c)
 
@@ -132,13 +130,12 @@ class SettingsTab(QWidget):
         self.video_vae.setText(c["video_vae"])
         self.audio_vae.setText(c["audio_vae"])
         self.lora_dir.setText(c["lora_dir"])
-        self.musubi_dir.setText(c["musubi_dir"])
-        self.musubi_python.setText(c["musubi_python"])
+        self.engine_python.setText(c["engine_python"])
+        self.keep_loaded.setChecked(bool(c["keep_loaded"]))
         self.output_dir.setText(c["output_dir"])
         self.blocks_to_swap.setValue(int(c["blocks_to_swap"]))
         self.te_blocks_to_swap.setValue(int(c["text_encoder_blocks_to_swap"]))
         self.attn_mode.setCurrentText(c["attn_mode"])
-        self.extra_args.setText(c["extra_args"])
         self.lm_url.setText(c["lmstudio_url"])
         self.temperature.setValue(float(c["llm_temperature"]))
         self.max_tokens.setValue(int(c["llm_max_tokens"]))
@@ -154,13 +151,12 @@ class SettingsTab(QWidget):
             "audio_vae": self.audio_vae.text(),
             "lora_dir": self.lora_dir.text(),
             "turbo_lora": self.turbo_lora.text(),
-            "musubi_dir": self.musubi_dir.text(),
-            "musubi_python": self.musubi_python.text(),
+            "engine_python": self.engine_python.text(),
+            "keep_loaded": self.keep_loaded.isChecked(),
             "output_dir": self.output_dir.text(),
             "blocks_to_swap": self.blocks_to_swap.value(),
             "text_encoder_blocks_to_swap": self.te_blocks_to_swap.value(),
             "attn_mode": self.attn_mode.currentText(),
-            "extra_args": self.extra_args.text().strip(),
             "lmstudio_url": self.lm_url.text().strip(),
             "llm_temperature": self.temperature.value(),
             "llm_max_tokens": self.max_tokens.value(),
@@ -179,4 +175,4 @@ class SettingsTab(QWidget):
         if problems:
             QMessageBox.warning(self, "Setup", "\n".join(problems))
         else:
-            QMessageBox.information(self, "Setup", "All models and musubi-tuner found. Ready to generate.")
+            QMessageBox.information(self, "Setup", f"All models and the engine Python found:\n{find_engine_python(self.cfg)}\n\nReady to generate.")
