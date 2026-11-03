@@ -1,0 +1,3 @@
+# Optional: SageAttention for the engine (~1.8x faster attention, near-identical output).
+# Install with: ./setup_engine.sh --sage   (Windows: setup_engine.bat sage)
+sageattention==1.0.6

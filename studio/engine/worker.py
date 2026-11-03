@@ -29,6 +29,7 @@ The orchestration follows musubi-tuner's minimax_h3_generate_video.py
 from __future__ import annotations
 
 import gc
+import importlib.util
 import json
 import logging
 import os
@@ -79,6 +80,16 @@ TEXT_CACHE_ENTRIES = 16
 MAX_BLOCKS_TO_SWAP = 48  # of the 50 DiT blocks
 SWAP_STEP = 12  # extra blocks moved to RAM per out-of-memory retry
 _PEFT_PREFIXES = ("model.diffusion_model.", "diffusion_model.", "transformer.", "base_model.model.")
+
+# attention backend -> package it needs (sdpa/torch are built into PyTorch)
+ATTENTION_PACKAGES = {"sageattn": "sageattention", "flash": "flash_attn", "flash3": "flash_attn_interface",
+                      "xformers": "xformers"}
+
+
+def available_attention() -> list[str]:
+    return ["sdpa", "torch"] + [mode for mode, pkg in ATTENTION_PACKAGES.items()
+                                if importlib.util.find_spec(pkg) is not None]
+
 
 _out = sys.stdout
 sys.stdout = sys.stderr  # stray prints from libraries must not corrupt the protocol
@@ -259,6 +270,10 @@ class Engine:
         self.release_transformer()
         emit("status", msg="Loading transformer…" if not swap else f"Loading transformer ({swap} of 50 blocks in RAM)…")
         attn = cfg["attn_mode"]
+        if attn not in available_attention():
+            logger.warning("Attention '%s' is not installed in the engine environment; using sdpa", attn)
+            emit("status", msg=f"'{attn}' is not installed, using sdpa…")
+            attn = "sdpa"
         transformer = load_h3_transformer(
             cfg["dit"], device="cpu" if swap else self.device, dtype=torch.bfloat16,
             attn_mode="torch" if attn == "sdpa" else attn, quant_device=self.device)
@@ -432,7 +447,7 @@ def main() -> None:
     engine = Engine()
     commands: queue.Queue = queue.Queue()
     threading.Thread(target=stdin_reader, args=(commands, engine), daemon=True).start()
-    emit("ready", device=str(engine.device),
+    emit("ready", device=str(engine.device), attention=available_attention(),
          gpu=torch.cuda.get_device_name(0) if torch.cuda.is_available() else None)
     while True:
         cmd = commands.get()

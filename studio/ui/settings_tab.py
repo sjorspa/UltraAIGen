@@ -76,13 +76,16 @@ class SettingsTab(QWidget):
         self.te_blocks_to_swap = QSpinBox(minimum=0, maximum=64)
         self.te_blocks_to_swap.setToolTip("Stream text-encoder layers from RAM (50 for GPUs with ≤24 GB).")
         self.attn_mode = QComboBox()
-        self.attn_mode.addItems(["sdpa", "torch", "flash", "flash3", "sageattn", "xformers"])
+        self.attn_hint = QLabel()
+        self.attn_hint.setObjectName("hint")
+        self.attn_hint.setWordWrap(True)
         f.addRow("Engine Python", self.engine_python)
         f.addRow("", self.keep_loaded)
         f.addRow("Output folder", self.output_dir)
         f.addRow("DiT blocks to swap", self.blocks_to_swap)
         f.addRow("Text encoder blocks to swap", self.te_blocks_to_swap)
         f.addRow("Attention", self.attn_mode)
+        f.addRow("", self.attn_hint)
         cl.addLayout(f)
         lay.addWidget(c)
 
@@ -102,7 +105,8 @@ class SettingsTab(QWidget):
         cl.addLayout(f)
         lay.addWidget(c)
 
-        for w in (self.blocks_to_swap, self.te_blocks_to_swap, self.attn_mode, self.temperature, self.max_tokens):
+        self.attn_mode.setMaximumWidth(520)
+        for w in (self.blocks_to_swap, self.te_blocks_to_swap, self.temperature, self.max_tokens):
             w.setMaximumWidth(220)
 
         row = QHBoxLayout()
@@ -135,7 +139,7 @@ class SettingsTab(QWidget):
         self.output_dir.setText(c["output_dir"])
         self.blocks_to_swap.setValue(int(c["blocks_to_swap"]))
         self.te_blocks_to_swap.setValue(int(c["text_encoder_blocks_to_swap"]))
-        self.attn_mode.setCurrentText(c["attn_mode"])
+        self.refresh_attention()
         self.lm_url.setText(c["lmstudio_url"])
         self.temperature.setValue(float(c["llm_temperature"]))
         self.max_tokens.setValue(int(c["llm_max_tokens"]))
@@ -156,13 +160,31 @@ class SettingsTab(QWidget):
             "output_dir": self.output_dir.text(),
             "blocks_to_swap": self.blocks_to_swap.value(),
             "text_encoder_blocks_to_swap": self.te_blocks_to_swap.value(),
-            "attn_mode": self.attn_mode.currentText(),
+            "attn_mode": self.attn_mode.currentData() or "sdpa",
             "lmstudio_url": self.lm_url.text().strip(),
             "llm_temperature": self.temperature.value(),
             "llm_max_tokens": self.max_tokens.value(),
             "send_images_to_llm": self.send_images.isChecked(),
             "unload_llm_before_generate": self.unload_llm.isChecked(),
         })
+
+    def refresh_attention(self):
+        """List the attention backends with what is installed in the engine environment."""
+        installed = backend.available_attention(self.cfg) or {"sdpa": True}
+        current = self.attn_mode.currentData() or self.cfg.get("attn_mode") or "sdpa"
+        if current == "torch":  # older name for sdpa
+            current = "sdpa"
+        self.attn_mode.clear()
+        for mode, (_pkg, description) in backend.ATTENTION_BACKENDS.items():
+            ok = installed.get(mode, False)
+            self.attn_mode.addItem(f"{mode}  ·  {description}" + ("" if ok else "  (not installed)"), mode)
+            item = self.attn_mode.model().item(self.attn_mode.count() - 1)
+            item.setEnabled(ok or mode == current)
+        self.attn_mode.setCurrentIndex(max(0, self.attn_mode.findData(current)))
+        missing = [] if installed.get("sageattn") else ["sageattn"]
+        self.attn_hint.setText(
+            "SageAttention is not installed. Add it with  ./setup_engine.sh --sage  (Windows: setup_engine.bat sage)."
+            if missing else "If a chosen backend is missing, the engine falls back to sdpa.")
 
     def save(self):
         self.apply()
@@ -171,6 +193,7 @@ class SettingsTab(QWidget):
 
     def check(self):
         self.apply()
+        self.refresh_attention()
         problems = backend.check_setup(self.cfg)
         if problems:
             QMessageBox.warning(self, "Setup", "\n".join(problems))

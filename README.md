@@ -82,6 +82,8 @@ The engine needs PyTorch with CUDA. One script creates its environment in `.engi
 
 The versions are pinned in `requirements-engine.txt`. On Windows, the script also installs `triton-windows` for the fast INT8 kernels.
 
+**Optional: SageAttention.** It makes sampling faster: about 25 % faster for a 5 s video at 768p, and more for longer videos. Install it with `./setup_engine.sh --sage` (Windows: `setup_engine.bat sage`), then choose `sageattn` under **Settings → Attention**. With an existing engine environment, only SageAttention is added.
+
 On the first generation, the engine downloads a few small tokenizer and config files from Hugging Face. It downloads no weights.
 
 ### 2. Ultra AI Generator
@@ -175,7 +177,7 @@ The LLM writes only the three H3 fields. The app adds the keyframe instruction l
 | Keep models loaded | On by default. The transformer stays loaded between generations; the text encoder and VAEs wait in RAM. Uses about 30 GB of RAM. Turn it off to free all memory after every video. |
 | DiT blocks to swap | The number of the 50 transformer blocks that are streamed from RAM. `16` is good for 32 GB. Use more for smaller GPUs, up to 48. |
 | Text encoder blocks to swap | `0` on 32 GB. `50` for GPUs with 24 GB or less. |
-| Attention | `sdpa` (default), or `flash`, `sageattn` and so on if they are installed. |
+| Attention | `sdpa` (default, exact) or `sageattn` (SageAttention, faster). The list shows which backends are installed in the engine environment. If the chosen one is missing, the engine falls back to `sdpa`. SageAttention computes attention with 8-bit Q/K. The result is just as sharp, but the same seed gives a slightly different variant than `sdpa`. |
 | LM Studio | API URL, temperature, max tokens, *send keyframes to the LLM*, *unload the LLM before generating*. |
 
 All settings are stored in `config.json`, and the presets in `system_prompts.json`.
@@ -192,7 +194,8 @@ These figures were measured on an RTX 5090 with 16 DiT blocks swapped.
 | 960×544, 5 s, turbo LoRA, 8 steps, first video | ~2 min |
 | 672×384, 2 s, turbo LoRA, 4 steps, first video | ~50 s |
 | Same, next video with models loaded (new seed) | **~15 s** |
-| 1344×768, 15 s (maximum), turbo LoRA, 4 steps | ~10 min (about 2 min per step) |
+| 1344×768, 5 s, turbo LoRA, 4 steps, sampling only | 105 s with `sdpa`, **79 s with `sageattn`** |
+| 1344×768, 15 s (maximum), turbo LoRA, 4 steps | ~10 min (about 2 min per step) with `sdpa` |
 
 With models loaded, the next video skips loading the transformer (about 12 s). If the prompt is unchanged, it also skips the text encoder (about 20 s).
 
