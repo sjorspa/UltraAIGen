@@ -111,20 +111,12 @@ def prepare_lora(cfg: dict, path: str) -> str:
     return str(dst)
 
 
-def _batch_line(job: Job) -> str:
-    # musubi splits prompt lines on " --" and turns a literal "\n" into a newline
-    prompt = job.prompt.replace(" --", " —").replace("\r", "").replace("\n", "\\n")
-    return f"{prompt} --d {job.seed} --o {Path(job.output_path).name}"
+def build_command(cfg: dict, job: Job) -> tuple[str, list[str], str]:
+    """Return (program, arguments, working directory) for one generation.
 
-
-def build_command(cfg: dict, jobs: list[Job]) -> tuple[str, list[str], str]:
-    """Return (program, arguments, working directory).
-
-    One job runs as a single generation; several jobs (same task, size and
-    keyframes, different seeds) run through ``--from_file`` so every model is
-    loaded only once for the whole batch.
+    Each video runs in its own process: musubi's --from_file batch mode leaves
+    swapped blocks on the CPU after the first prompt when block swap is enabled.
     """
-    job = jobs[0]
     task = "t2va" if job.task == "t2va" else "fl2va"
     args = [
         str(LAUNCHER),
@@ -139,14 +131,10 @@ def build_command(cfg: dict, jobs: list[Job]) -> tuple[str, list[str], str]:
         "--frame_count", str(job.frame_count),
         "--steps", str(job.steps),
         "--attn_mode", cfg.get("attn_mode") or "sdpa",
+        "--prompt", job.prompt,
+        "--seed", str(job.seed),
+        "--output", job.output_path,
     ]
-    if len(jobs) == 1:
-        args += ["--prompt", job.prompt, "--seed", str(job.seed), "--output", job.output_path]
-    else:
-        batch = CACHE_DIR / "batch_prompts.txt"
-        batch.parent.mkdir(parents=True, exist_ok=True)
-        batch.write_text("\n".join(_batch_line(j) for j in jobs) + "\n", encoding="utf-8")
-        args += ["--from_file", str(batch), "--output", str(Path(job.output_path).parent)]
     if job.task in ("i2va", "fl2va"):
         if not job.first_frame:
             raise BackendError("This mode needs a first frame.")

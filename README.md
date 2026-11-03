@@ -24,7 +24,7 @@ Works on **Linux and Windows**.
 - **Turbo LoRA.** One switch, with 4, 6 or 8 steps.
 - **Seed control and batches:**
   - Seed modes: fixed, random or increment.
-  - Generate several videos per click. The models are loaded only once per batch.
+  - Generate several videos per click. They run one after another, each with its own seed.
 - **Built-in player and history.** Every video is saved with a `.json` sidecar that holds the prompt and settings, and **Reuse prompt** restores them.
 - **Configurable paths.** You set every model path, the LoRA folder, the engine location and the output folder in the app.
 
@@ -138,7 +138,7 @@ Both scripts create the GUI's virtual environment on the first start (PySide6 + 
 | **Turbo** | Uses the turbo LoRA with **4, 6 or 8 steps**, instead of the normal step count of about 20–30. |
 | **Steps** | Number of model evaluations without turbo. |
 | **Seed** | **Fixed** uses this seed; several videos get seed, seed+1, and so on. **Random** gives each video a new seed. **Increment** works like fixed, then moves the seed on for the next click. |
-| **Count** | Number of videos per click. |
+| **Count** | Number of videos per click. Each video runs as its own process, one after another. |
 | **LoRA 1/2** | Extra LoRAs from the LoRA folder, each with a strength. |
 
 ### History
@@ -190,7 +190,7 @@ These figures were measured on an RTX 5090 with 16 DiT blocks swapped. Model loa
 | 960×544, 5 s, 20 steps | ~3 min 25 s |
 | 960×544, 5 s, turbo LoRA, 8 steps | ~2 min |
 
-Batches load every model once, so each extra video costs only sampling and decoding.
+In a batch, every video loads the models again (about 1 minute). musubi's `--from_file` batch mode would load them only once, but with block swap enabled it fails from the second prompt onward, so the app does not use it.
 
 ---
 

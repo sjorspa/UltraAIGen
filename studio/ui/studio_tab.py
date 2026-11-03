@@ -25,7 +25,6 @@ ASPECT_FROM_IMAGE = "From keyframe"
 ASPECT_CUSTOM = "Custom"
 SEED_MODES = [("fixed", "Fixed"), ("random", "Random"), ("increment", "Increment")]
 _TQDM_RE = re.compile(r"MiniMax-H3:\s*(\d+)%\|.*?(\d+)/(\d+)\s*\[([^\]]*)\]")
-_SAVED_RE = re.compile(r"Saved MiniMax-H3 output:\s*(.+\.mp4)")
 
 
 def image_ratio(path: str) -> float | None:
@@ -61,7 +60,7 @@ class StudioTab(QWidget):
         self.jobs: list[backend.Job] = []
         self.job_meta: dict = {}
         self.out_buffer = ""
-        self.saved_paths: list[str] = []
+        self.done_paths: list[str] = []
         self.enhance_thread: FuncThread | None = None
         self.models_thread: FuncThread | None = None
         self.timer = QElapsedTimer()
@@ -239,7 +238,7 @@ class StudioTab(QWidget):
         turbo_row.addWidget(self.turbo_steps)
         turbo_row.addWidget(self.turbo_info, 1)
         self.count = QSpinBox(minimum=1, maximum=99)
-        self.count.setToolTip("Videos per click. With more than one, the models are loaded only once.")
+        self.count.setToolTip("Videos per click. They run one after another, each with its own seed.")
         g.addWidget(QLabel("Frame"), 0, 0)
         g.addLayout(res_row, 0, 1)
         g.addLayout(wh, 1, 1)
@@ -646,7 +645,7 @@ class StudioTab(QWidget):
             if loras:
                 self.status.setText("Preparing LoRA…")
                 self.repaint()
-            program, args, cwd = backend.build_command(self.cfg, self.jobs)
+            backend.build_command(self.cfg, self.jobs[0])
         except (backend.BackendError, OSError) as e:
             QMessageBox.warning(self, "Generate", str(e))
             return
@@ -663,7 +662,28 @@ class StudioTab(QWidget):
         self.player.stop()
         self.player.setSource(QUrl())
         self.log.clear()
-        self.log.appendPlainText("$ " + " ".join([program] + [a if len(a) < 120 else a[:117] + "…" for a in args]) + "\n")
+        self.job_index = 0
+        self.stopped = False
+        self.done_paths = []
+        self.gen_btn.setEnabled(False)
+        self.stop_btn.setEnabled(True)
+        self.timer.start()
+        self.tick.start()
+        self._start_job()
+
+    def _start_job(self):
+        """Run the current job in its own process; _finished starts the next one."""
+        job = self.jobs[self.job_index]
+        try:
+            program, args, cwd = backend.build_command(self.cfg, job)
+        except (backend.BackendError, OSError) as e:
+            self.log.appendPlainText(str(e))
+            self._end_queue()
+            return
+        n = len(self.jobs)
+        header = f"=== Video {self.job_index + 1}/{n} · seed {job.seed} ===\n" if n > 1 else ""
+        self.log.appendPlainText(header + "$ " + " ".join(
+            [program] + [a if len(a) < 120 else a[:117] + "…" for a in args]) + "\n")
         self.proc = QProcess(self)
         env = QProcessEnvironment.systemEnvironment()
         env.insert("PYTHONUNBUFFERED", "1")
@@ -675,17 +695,14 @@ class StudioTab(QWidget):
         self.proc.finished.connect(self._finished)
         self.proc.errorOccurred.connect(self._proc_error)
         self.out_buffer = ""
-        self.saved_paths = []
-        self.sample_index = 1
-        self.last_step = 0
-        self.phase = "Loading models…"
+        self.phase = self._video_prefix() + "Loading models…"
         self.progress.setRange(0, 0)
-        self.gen_btn.setEnabled(False)
-        self.stop_btn.setEnabled(True)
-        self.timer.start()
-        self.tick.start()
         self._update_elapsed()
         self.proc.start(program, args)
+
+    def _video_prefix(self) -> str:
+        n = len(self.jobs)
+        return f"Video {self.job_index + 1}/{n} · " if n > 1 else ""
 
     def _read_output(self):
         self.out_buffer += bytes(self.proc.readAllStandardOutput()).decode("utf-8", "replace")
@@ -702,28 +719,21 @@ class StudioTab(QWidget):
         if m:
             pct, step, total, timing = m.groups()
             step, total = int(step), int(total)
-            if step < self.last_step:
-                self.sample_index += 1
-            self.last_step = step
             n = len(self.jobs)
             self.progress.setRange(0, 100)
-            self.progress.setValue(int(((self.sample_index - 1) * total + step) * 100 / (n * total)))
+            self.progress.setValue(int((self.job_index * total + step) * 100 / (n * total)))
             eta = timing.split("<")[-1].split(",")[0] if "<" in timing else ""
-            video = f"Video {self.sample_index}/{n} · " if n > 1 else ""
-            self.phase = f"{video}Sampling step {step}/{total}" + (f" · {eta} left" if eta else "")
+            self.phase = f"{self._video_prefix()}Sampling step {step}/{total}" + (f" · {eta} left" if eta else "")
             self._update_elapsed()
             return
         if "INFO" in line:
             msg = line.split(":", 2)[-1].strip()
             low = msg.lower()
             if "loading" in low or "encoding" in low or "decoding" in low:
-                self.phase = msg.replace("MiniMax-H3 ", "") + "…"
+                self.phase = self._video_prefix() + msg.replace("MiniMax-H3 ", "") + "…"
                 if "decoding" in low:
                     self.progress.setRange(0, 0)
                 self._update_elapsed()
-        m = _SAVED_RE.search(line)
-        if m:
-            self.saved_paths.append(m.group(1).strip())
         # gcc/triton header noise is not useful in the log
         if not re.search(r"pyconfig\.h|_POSIX_C_SOURCE|features\.h|__triton_launcher|^\s*\||^\s*\d+ \|", line):
             self.log.appendPlainText(line)
@@ -735,6 +745,7 @@ class StudioTab(QWidget):
 
     def stop(self):
         if self.proc:
+            self.stopped = True
             self.phase = "Stopping…"
             self.proc.kill()
 
@@ -745,29 +756,36 @@ class StudioTab(QWidget):
     def _finished(self, code: int, _status):
         if self.out_buffer:
             self._handle_line(self.out_buffer)
+        self.proc.deleteLater()
+        self.proc = None
+        job = self.jobs[self.job_index]
+        out = Path(job.output_path)
+        if code == 0 and out.is_file():
+            meta = dict(self.job_meta, seed=job.seed, seconds=self.timer.elapsed() // 1000)
+            out.with_suffix(".json").write_text(json.dumps(meta, indent=2, ensure_ascii=False), encoding="utf-8")
+            self.done_paths.append(str(out))
+            self.refresh_history(select=str(out))
+            self.play(str(out))
+        self.job_index += 1
+        if not self.stopped and self.job_index < len(self.jobs):
+            self._start_job()
+        else:
+            self._end_queue(code)
+
+    def _end_queue(self, code: int = 1):
         self.tick.stop()
-        secs = self.timer.elapsed() // 1000
         self.gen_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)
         self.progress.setRange(0, 100)
-        self.proc.deleteLater()
-        self.proc = None
-        # sidecar metadata for every finished video (a batch may have partial success)
-        done = []
-        for job in self.jobs:
-            p = Path(job.output_path)
-            if p.is_file():
-                meta = dict(self.job_meta, seed=job.seed, seconds=secs)
-                p.with_suffix(".json").write_text(json.dumps(meta, indent=2, ensure_ascii=False), encoding="utf-8")
-                done.append(str(p))
+        secs = self.timer.elapsed() // 1000
         t = f"{secs // 60}:{secs % 60:02d}"
+        done = self.done_paths
         if done:
             self.progress.setValue(100)
-            extra = "" if len(done) == len(self.jobs) else f"  ·  {len(self.jobs) - len(done)} failed"
+            failed = len(self.jobs) - len(done)
+            extra = f"  ·  {failed} failed or stopped" if failed else ""
             label = Path(done[0]).name if len(done) == 1 else f"{len(done)} videos"
             self.status.setText(f"✓ Done in {t}  ·  {label}{extra}")
-            self.refresh_history(select=done[-1])
-            self.play(done[-1])
         else:
             self.progress.setValue(0)
             self.status.setText(f"✕ Stopped or failed (exit code {code}) after {t}. See the log.")
