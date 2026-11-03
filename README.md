@@ -192,8 +192,21 @@ These figures were measured on an RTX 5090 with 16 DiT blocks swapped.
 | 960×544, 5 s, turbo LoRA, 8 steps, first video | ~2 min |
 | 672×384, 2 s, turbo LoRA, 4 steps, first video | ~50 s |
 | Same, next video with models loaded (new seed) | **~15 s** |
+| 1344×768, 15 s (maximum), turbo LoRA, 4 steps | ~10 min (about 2 min per step) |
 
 With models loaded, the next video skips loading the transformer (about 12 s). If the prompt is unchanged, it also skips the text encoder (about 20 s).
+
+Long, high-resolution videos are slow because attention cost grows with the square of the sequence length: 15 s at 768p is about 109,000 tokens.
+
+### Memory management
+
+Like ComfyUI, the engine manages GPU memory per job:
+
+- **Text encoder.** It is freed right after encoding the prompt, so it never takes VRAM away from sampling. The encoded prompt is cached, so a new seed does not need the text encoder again.
+- **Long sequences.** The token-wise parts of the transformer (attention projections and MLP) run in chunks of 16,384 tokens. Short videos take the original code path and stay bit-identical.
+- **Sampling does not fit.** The engine moves more transformer blocks to RAM (16 → 28 → 40 → 48) and retries with the same seed. It remembers the setting that worked for that size.
+- **Decoding does not fit next to the loaded transformer.** The engine frees the transformer and decodes again.
+- **After an error.** All memory is released, so VRAM really drops back to idle.
 
 ---
 

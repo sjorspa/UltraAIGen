@@ -14,10 +14,13 @@ Events
   ready · status{msg} · progress{step,total} · done{id,path,seconds}
   · error{id,msg} · cancelled{id} · released
 
-With ``keep_loaded`` the transformer stays loaded between jobs (the text
-encoder idles in RAM and streams its layers, the VAEs idle in RAM), and the
-text conditioning of each prompt is cached, so a new seed or a batch skips
-both the model load and the text encoder.
+With ``keep_loaded`` the transformer stays loaded between jobs and the VAEs
+idle in RAM. The text encoder is always freed right after encoding (like
+ComfyUI, it must not hold VRAM while sampling), but the text conditioning of
+each prompt is cached, so a new seed or a batch skips both the model load and
+the text encoder. When a size does not fit in VRAM, sampling is retried with
+more transformer blocks streamed from RAM, and decoding frees the transformer
+first if needed.
 
 The orchestration follows musubi-tuner's minimax_h3_generate_video.py
 (Apache-2.0); the model code itself is the vendored ``h3core`` package.
@@ -73,9 +76,8 @@ logging.basicConfig(level=logging.INFO, stream=sys.stderr, format="%(levelname)s
 logger = logging.getLogger("engine")
 
 TEXT_CACHE_ENTRIES = 16
-# in keep-loaded mode the text encoder shares the GPU with the resident transformer,
-# so it streams its layers from RAM (the H3 presentation uses the first 50 Qwen layers)
-RESIDENT_TEXT_ENCODER_SWAP = 50
+MAX_BLOCKS_TO_SWAP = 48  # of the 50 DiT blocks
+SWAP_STEP = 12  # extra blocks moved to RAM per out-of-memory retry
 _PEFT_PREFIXES = ("model.diffusion_model.", "diffusion_model.", "transformer.", "base_model.model.")
 
 _out = sys.stdout
@@ -176,6 +178,7 @@ class Engine:
         self.audio_vae = None
         self.vae_paths = None
         self.text_cache: OrderedDict[str, tuple[torch.Tensor, torch.Tensor]] = OrderedDict()
+        self.auto_swap: dict[tuple[int, int, int], int] = {}  # blocks_to_swap that fit, per (w, h, frames)
 
     # ---- memory
     def release_transformer(self) -> None:
@@ -246,16 +249,15 @@ class Engine:
             self.audio_vae.to("cpu")
             clean_memory_on_device(self.device)
 
-    def acquire_transformer(self, cfg: dict, loras: list[list]):
-        key = (cfg["dit"], int(cfg["blocks_to_swap"]), cfg["attn_mode"],
+    def acquire_transformer(self, cfg: dict, loras: list[list], swap: int):
+        key = (cfg["dit"], swap, cfg["attn_mode"],
                tuple((str(p), float(m)) for p, m in loras))
         if self.transformer is not None and self.transformer_key == key:
             # finish pending block transfers from the previous run, then reset placement
             self.transformer.switch_block_swap_for_inference()
             return self.transformer
         self.release_transformer()
-        emit("status", msg="Loading transformer…")
-        swap = int(cfg["blocks_to_swap"])
+        emit("status", msg="Loading transformer…" if not swap else f"Loading transformer ({swap} of 50 blocks in RAM)…")
         attn = cfg["attn_mode"]
         transformer = load_h3_transformer(
             cfg["dit"], device="cpu" if swap else self.device, dtype=torch.bfloat16,
@@ -272,7 +274,7 @@ class Engine:
         self.transformer, self.transformer_key = transformer, key
         return transformer
 
-    def encode_text(self, cfg: dict, request: H3GenerationRequest, record, text_visuals, keep: bool):
+    def encode_text(self, cfg: dict, request: H3GenerationRequest, record, text_visuals):
         presentation = build_presentation(record, request.task, text_visuals)
         media = {Path(path): fingerprint_file(path) for _, path in fl_condition_entries(request)} \
             if request.task == "fl2va" else {}
@@ -282,25 +284,39 @@ class Engine:
             self.text_cache.move_to_end(cache_key)
             emit("status", msg="Reusing cached text conditioning…")
             return cached
-        swap = max(int(cfg["text_encoder_blocks_to_swap"]), RESIDENT_TEXT_ENCODER_SWAP if keep else 0)
-        te_key = (cfg["text_encoder"], swap)
-        if self.text_encoder is None or self.text_encoder_key != te_key:
-            self.release_text_encoder()
-            emit("status", msg="Loading text encoder…")
-            self.processor = load_h3_processor()
-            self.text_encoder = load_h3_text_encoder(
-                cfg["text_encoder"], device=self.device, dtype=torch.bfloat16, blocks_to_swap=swap)
-            self.text_encoder_key = te_key
+        # the transformer is not needed while encoding: give its VRAM to the text encoder
+        self.release_transformer()
+        emit("status", msg="Loading text encoder…")
+        self.processor = load_h3_processor()
+        self.text_encoder = load_h3_text_encoder(
+            cfg["text_encoder"], device=self.device, dtype=torch.bfloat16,
+            blocks_to_swap=int(cfg["text_encoder_blocks_to_swap"]))
         emit("status", msg="Encoding prompt…")
-        hidden, tags = encode_h3_presentation(self.processor, self.text_encoder, presentation)
-        if not keep:
-            self.release_text_encoder()
-        clean_memory_on_device(self.device)
+        try:
+            hidden, tags = encode_h3_presentation(self.processor, self.text_encoder, presentation)
+        finally:
+            self.release_text_encoder()  # never keep it next to the transformer
         result = (hidden.to(torch.bfloat16).unsqueeze(0).cpu(), tags.unsqueeze(0).cpu())
         self.text_cache[cache_key] = result
         while len(self.text_cache) > TEXT_CACHE_ENTRIES:
             self.text_cache.popitem(last=False)
         return result
+
+    def decode_video(self, cfg: dict, latents: torch.Tensor, keep: bool) -> torch.Tensor:
+        """Decode on the GPU; if the VAE does not fit next to the loaded transformer, free it and retry."""
+        for attempt in (1, 2):
+            oom = False
+            try:
+                with self.video_vae(cfg, VIDEO_VAE_DECODE_DTYPE, keep) as vae, torch.no_grad():
+                    return vae.decode(latents.to(device=self.device, dtype=VIDEO_VAE_DECODE_DTYPE)).cpu()
+            except torch.OutOfMemoryError:
+                oom = True
+            if oom and attempt == 1 and self.transformer is not None:
+                emit("status", msg="Freeing the transformer to make room for decoding…")
+                self.release_transformer()
+                continue
+            break
+        raise torch.OutOfMemoryError("not enough VRAM to decode this video")
 
     # ---- one generation
     def generate(self, cfg: dict, job: dict) -> Path:
@@ -327,7 +343,7 @@ class Engine:
 
         record = load_generation_record(request)
         raw_visuals, text_visuals = decode_generation_visuals(request, record, self.decoder)
-        hidden, tags = self.encode_text(cfg, request, record, text_visuals, keep)
+        hidden, tags = self.encode_text(cfg, request, record, text_visuals)
 
         visual_conditions, visual_geometries = (), ()
         if request.task != "t2va":
@@ -339,32 +355,49 @@ class Engine:
         del raw_visuals, text_visuals
         layout = build_generation_layout(request, text_length=hidden.shape[1], visual_geometries=visual_geometries)
 
-        transformer = self.acquire_transformer(cfg, job.get("loras") or [])
-        emit("status", msg="Sampling…")
-
         def on_step(completed: int, total: int) -> None:
             emit("progress", step=completed, total=total)
             if self.cancel.is_set():
                 raise Cancelled()
 
-        try:
-            sample = sample_joint_av_latents(
-                transformer, layout=layout, seed=request.seed, text_hidden_states=hidden, text_token_tags=tags,
-                visual_conditions=visual_conditions, steps=request.steps, video_shift=request.h3_shift_video,
-                audio_shift=request.h3_shift_audio, visual_condition_clean=request.h3_visual_cond_clean,
-                audio_condition_clean=request.h3_audio_cond_clean, device=self.device, step_callback=on_step)
-        finally:
-            if transformer.offloader is not None:
-                transformer.offloader.set_forward_only(True)  # never leave block transfers pending
-            if not keep:
+        shape = (request.width, request.height, request.frame_count)
+        swap = max(int(cfg["blocks_to_swap"]), self.auto_swap.get(shape, 0))
+        sample = None
+        while sample is None:
+            transformer = self.acquire_transformer(cfg, job.get("loras") or [], swap)
+            emit("status", msg="Sampling…")
+            oom = False
+            try:
+                sample = sample_joint_av_latents(
+                    transformer, layout=layout, seed=request.seed, text_hidden_states=hidden, text_token_tags=tags,
+                    visual_conditions=visual_conditions, steps=request.steps, video_shift=request.h3_shift_video,
+                    audio_shift=request.h3_shift_audio, visual_condition_clean=request.h3_visual_cond_clean,
+                    audio_condition_clean=request.h3_audio_cond_clean, device=self.device, step_callback=on_step)
+            except torch.OutOfMemoryError:
+                oom = True
+                traceback.print_exc(limit=-4)  # where it ran out, for the log
+            finally:
+                if transformer.offloader is not None:
+                    transformer.offloader.set_forward_only(True)  # never leave block transfers pending
+                del transformer
+            if oom:
+                # outside the except block: the traceback no longer pins the activations
                 self.release_transformer()
-            del transformer
-            gc.collect()
-            clean_memory_on_device(self.device)
+                if swap >= MAX_BLOCKS_TO_SWAP:
+                    raise torch.OutOfMemoryError(
+                        f"{request.width}×{request.height}, {request.frame_count} frames does not fit in VRAM "
+                        f"even with {swap} of 50 transformer blocks in RAM")
+                swap = min(MAX_BLOCKS_TO_SWAP, max(swap + SWAP_STEP, SWAP_STEP))
+                self.auto_swap[shape] = swap
+                logger.warning("Out of VRAM while sampling %s; retrying with blocks_to_swap=%d", shape, swap)
+                emit("status", msg=f"Not enough VRAM for this size: retrying with {swap} of 50 blocks in RAM…")
+        if not keep:
+            self.release_transformer()
+        gc.collect()
+        clean_memory_on_device(self.device)
 
         emit("status", msg="Decoding video…")
-        with self.video_vae(cfg, VIDEO_VAE_DECODE_DTYPE, keep) as vae, torch.no_grad():
-            video = vae.decode(sample.video.to(device=self.device, dtype=VIDEO_VAE_DECODE_DTYPE)).cpu()
+        video = self.decode_video(cfg, sample.video, keep)
         emit("status", msg="Decoding audio…")
         with self.audio_vae_ctx(cfg, keep) as vae, torch.no_grad():
             audio = vae.decode(sample.audio.to(device=self.device, dtype=torch.float32)).cpu()
@@ -413,18 +446,28 @@ def main() -> None:
             job_id = cmd.get("id")
             engine.cancel.clear()
             start = time.time()
+            error, out_of_memory = None, False
             try:
                 path = engine.generate(cmd["config"], cmd["job"])
                 emit("done", id=job_id, path=str(path), seconds=round(time.time() - start))
             except Cancelled:
                 emit("cancelled", id=job_id)
             except torch.OutOfMemoryError as e:
-                engine.release()
-                emit("error", id=job_id, msg=f"Out of GPU memory: {e}. All models were unloaded; "
-                                             "raise 'DiT blocks to swap' or close other GPU programs.")
+                out_of_memory = True
+                error = (f"Out of GPU memory: {str(e).splitlines()[0]}. All models were unloaded. "
+                         "Try a lower resolution tier or a shorter duration, or close other GPU programs.")
             except Exception as e:  # reported to the GUI; the engine keeps running
                 traceback.print_exc()
-                emit("error", id=job_id, msg=f"{type(e).__name__}: {e}")
+                error = f"{type(e).__name__}: {e}"
+            # free memory only after the except block: until then the exception's traceback
+            # keeps every tensor of the failed run alive, so nothing would actually be released
+            if out_of_memory:
+                engine.release()
+            else:
+                gc.collect()
+                clean_memory_on_device(engine.device)
+            if error:
+                emit("error", id=job_id, msg=error)
 
 
 if __name__ == "__main__":

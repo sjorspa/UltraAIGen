@@ -407,6 +407,12 @@ def _element_extent(tensor: torch.Tensor) -> int:
 _INT32_SAFE_EXTENT = 2**31
 
 
+# Ultra AI Generator: token chunk size for the token-wise projections (attention qkv/out
+# and MLP) of long sequences, e.g. 15 s at 768p (~109k tokens). Shorter sequences keep the
+# original single-pass code path.
+TOKEN_CHUNK = 16384
+
+
 class Attention(nn.Module):
     def __init__(
         self,
@@ -431,8 +437,59 @@ class Attention(nn.Module):
         self.k_norm = nn.RMSNorm(head_dim, eps=qk_norm_eps, dtype=dtype, device=device)
         self.out_proj = nn.Linear(self.inner_dim, hidden_size, bias=False, dtype=dtype, device=device)
 
+    def _project_qkv(self, hidden_states: torch.Tensor, rotation_table: torch.Tensor | None):
+        """qkv projection, q/k RMSNorm and RoPE for a token range (all token-wise)."""
+        batch_size, sequence_length, _ = hidden_states.shape
+        query, key, value = self.qkv_proj(hidden_states).split(self.inner_dim, dim=-1)
+        query = self.q_norm(query.reshape(batch_size, sequence_length, self.num_heads, self.head_dim))
+        key = self.k_norm(key.reshape(batch_size, sequence_length, self.num_heads, self.head_dim))
+        value = value.reshape(batch_size, sequence_length, self.num_heads, self.head_dim)
+        if rotation_table is not None:
+            query = _apply_rope_split_half(query, rotation_table)
+            key = _apply_rope_split_half(key, rotation_table)
+        return query.to(value), key.to(value), value
+
+    def _chunked_qkv(self, hidden_states: torch.Tensor, rotation_table: torch.Tensor | None):
+        """Ultra AI Generator: fill full-length q/k/v buffers chunk by chunk, so the fused qkv
+        output and the norm/RoPE temporaries never exist for the whole sequence at once."""
+        batch_size, sequence_length, _ = hidden_states.shape
+        buffers = None
+        for start in range(0, sequence_length, TOKEN_CHUNK):
+            stop = min(start + TOKEN_CHUNK, sequence_length)
+            table = rotation_table[:, start:stop] if rotation_table is not None else None
+            parts = self._project_qkv(hidden_states[:, start:stop], table)
+            if buffers is None:
+                shape = (batch_size, sequence_length, self.num_heads, self.head_dim)
+                buffers = [torch.empty(shape, dtype=part.dtype, device=part.device) for part in parts]
+            for buffer, part in zip(buffers, parts):
+                buffer[:, start:stop] = part
+            del parts
+        return buffers
+
+    def _chunked_out_proj(self, output: torch.Tensor) -> torch.Tensor:
+        result = None
+        for start in range(0, output.shape[1], TOKEN_CHUNK):
+            part = self.out_proj(output[:, start : start + TOKEN_CHUNK])
+            if result is None:
+                result = torch.empty((*output.shape[:2], part.shape[-1]), dtype=part.dtype, device=part.device)
+            result[:, start : start + TOKEN_CHUNK] = part
+        return result
+
     def forward(self, hidden_states: torch.Tensor, rotation_table: torch.Tensor | None = None) -> torch.Tensor:
         batch_size, sequence_length, _ = hidden_states.shape
+        if sequence_length > TOKEN_CHUNK:
+            query, key, value = self._chunked_qkv(hidden_states, rotation_table)
+            params = AttentionParams.create_attention_params(self.attn_mode, self.split_attn)
+            if self.attn_mode == "flash3":
+                from h3core.wan.modules.attention import flash_attention as wan_flash_attention
+
+                output = wan_flash_attention([query, key, value], attn_mode="flash3", split_attn=False,
+                                             dtype=value.dtype if value.dtype in {torch.float16, torch.bfloat16} else torch.bfloat16)
+                output = output.reshape(batch_size, sequence_length, self.inner_dim)
+            else:
+                output = attention([query, key, value], attn_params=params)
+            del query, key, value
+            return self._chunked_out_proj(output)
         query, key, value = self.qkv_proj(hidden_states).split(self.inner_dim, dim=-1)
         query = self.q_norm(query.reshape(batch_size, sequence_length, self.num_heads, self.head_dim))
         key = self.k_norm(key.reshape(batch_size, sequence_length, self.num_heads, self.head_dim))
@@ -480,8 +537,18 @@ class MLP(nn.Module):
         self.fc2 = nn.Linear(ffn_hidden_size, hidden_size, bias=False, dtype=dtype, device=device)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        gate, values = self.fc1(hidden_states).chunk(2, dim=-1)
-        return self.fc2(F.silu(gate) * values)
+        tokens = hidden_states.shape[-2]
+        if tokens <= TOKEN_CHUNK:
+            gate, values = self.fc1(hidden_states).chunk(2, dim=-1)
+            return self.fc2(F.silu(gate) * values)
+        # Ultra AI Generator: the MLP is token-wise, so long sequences (e.g. 15 s at 768p,
+        # ~108k tokens) run in token chunks; the full fc1 output alone would need ~9 GB
+        output = torch.empty_like(hidden_states)
+        for start in range(0, tokens, TOKEN_CHUNK):
+            stop = min(start + TOKEN_CHUNK, tokens)
+            gate, values = self.fc1(hidden_states[..., start:stop, :]).chunk(2, dim=-1)
+            output[..., start:stop, :] = self.fc2(F.silu(gate) * values)
+        return output
 
 
 class RefinerBlock(nn.Module):

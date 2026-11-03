@@ -25,3 +25,9 @@ Modifications made for Ultra AI Generator:
   besides "DiTBlock", so LoRAs that adapt the text-token refiner (such as the
   H3 turbo LoRA) load completely. Training defaults are unaffected because the
   default target pattern only matches the main DiT blocks.
+- minimax_h3/model.py: for sequences longer than 16384 tokens (TOKEN_CHUNK),
+  the token-wise parts run in token chunks: the MLP, and in attention the qkv
+  projection, q/k RMSNorm, RoPE and the output projection (written into
+  full-length q/k/v buffers; the attention itself still sees the whole
+  sequence). This changes only peak memory. Shorter sequences take the
+  original code path unchanged.
