@@ -31,3 +31,6 @@ Modifications made for Ultra AI Generator:
   full-length q/k/v buffers; the attention itself still sees the whole
   sequence). This changes only peak memory. Shorter sequences take the
   original code path unchanged.
+- minimax_h3/model.py: attention mode "ck_int8" calls the INT8 attention of
+  comfy-kitchen (https://github.com/Comfy-Org/comfy-kitchen, Apache-2.0) when
+  that optional package is installed.

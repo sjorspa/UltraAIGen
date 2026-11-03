@@ -407,6 +407,17 @@ def _element_extent(tensor: torch.Tensor) -> int:
 _INT32_SAFE_EXTENT = 2**31
 
 
+def _ck_int8_attention(query: torch.Tensor, key: torch.Tensor, value: torch.Tensor) -> torch.Tensor:
+    """Ultra AI Generator: comfy-kitchen INT8 attention (Apache-2.0, optional package).
+
+    q/k/v arrive as [B, L, H, D]; comfy-kitchen takes [B, H, L, D]. Returns [B, L, H*D].
+    """
+    import comfy_kitchen as ck
+
+    output = ck.int8_attention(query.transpose(1, 2), key.transpose(1, 2), value.transpose(1, 2))
+    return output.transpose(1, 2).reshape(output.shape[0], output.shape[2], -1)
+
+
 # Ultra AI Generator: token chunk size for the token-wise projections (attention qkv/out
 # and MLP) of long sequences, e.g. 15 s at 768p (~109k tokens). Shorter sequences keep the
 # original single-pass code path.
@@ -486,6 +497,8 @@ class Attention(nn.Module):
                 output = wan_flash_attention([query, key, value], attn_mode="flash3", split_attn=False,
                                              dtype=value.dtype if value.dtype in {torch.float16, torch.bfloat16} else torch.bfloat16)
                 output = output.reshape(batch_size, sequence_length, self.inner_dim)
+            elif self.attn_mode == "ck_int8":
+                output = _ck_int8_attention(query, key, value)
             else:
                 output = attention([query, key, value], attn_params=params)
             del query, key, value
@@ -517,6 +530,8 @@ class Attention(nn.Module):
                 dtype=hidden_states.dtype if hidden_states.dtype in {torch.float16, torch.bfloat16} else torch.bfloat16,
             )
             output = output.reshape(batch_size, sequence_length, self.inner_dim)
+        elif self.attn_mode == "ck_int8":
+            output = _ck_int8_attention(query, key, value)
         else:
             params = AttentionParams.create_attention_params(self.attn_mode, self.split_attn)
             output = attention([query, key, value], attn_params=params)
@@ -721,7 +736,7 @@ class MiniMaxH3Model(nn.Module):
         device: torch.device | str | None = None,
     ) -> None:
         super().__init__()
-        if attn_mode not in {"torch", "sdpa", "flash", "flash3", "sageattn", "xformers"}:
+        if attn_mode not in {"torch", "sdpa", "flash", "flash3", "sageattn", "xformers", "ck_int8"}:
             raise ValueError(f"Unsupported MiniMax-H3 attention mode: {attn_mode}")
         self.config = config
         self.attn_mode = attn_mode

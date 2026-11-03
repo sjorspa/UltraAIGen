@@ -82,13 +82,24 @@ SWAP_STEP = 12  # extra blocks moved to RAM per out-of-memory retry
 _PEFT_PREFIXES = ("model.diffusion_model.", "diffusion_model.", "transformer.", "base_model.model.")
 
 # attention backend -> package it needs (sdpa/torch are built into PyTorch)
-ATTENTION_PACKAGES = {"sageattn": "sageattention", "flash": "flash_attn", "flash3": "flash_attn_interface",
-                      "xformers": "xformers"}
+ATTENTION_PACKAGES = {"ck_int8": "comfy_kitchen", "sageattn": "sageattention", "flash": "flash_attn",
+                      "flash3": "flash_attn_interface", "xformers": "xformers"}
+
+
+def _ck_int8_supported() -> bool:
+    try:
+        import comfy_kitchen as ck
+        return bool(ck.int8_attention_is_available())
+    except Exception:  # missing package, or no kernel for this GPU
+        return False
 
 
 def available_attention() -> list[str]:
-    return ["sdpa", "torch"] + [mode for mode, pkg in ATTENTION_PACKAGES.items()
-                                if importlib.util.find_spec(pkg) is not None]
+    modes = ["sdpa", "torch"] + [mode for mode, pkg in ATTENTION_PACKAGES.items()
+                                 if importlib.util.find_spec(pkg) is not None]
+    if "ck_int8" in modes and not _ck_int8_supported():
+        modes.remove("ck_int8")
+    return modes
 
 
 _out = sys.stdout

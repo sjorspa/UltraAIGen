@@ -181,10 +181,11 @@ class SettingsTab(QWidget):
             item = self.attn_mode.model().item(self.attn_mode.count() - 1)
             item.setEnabled(ok or mode == current)
         self.attn_mode.setCurrentIndex(max(0, self.attn_mode.findData(current)))
-        missing = [] if installed.get("sageattn") else ["sageattn"]
+        missing = [m for m in ("ck_int8", "sageattn") if not installed.get(m)]
         self.attn_hint.setText(
-            "SageAttention is not installed. Add it with  ./setup_engine.sh --sage  (Windows: setup_engine.bat sage)."
-            if missing else "If a chosen backend is missing, the engine falls back to sdpa.")
+            f"Not installed: {', '.join(missing)}. Add the fast attention backends with  ./setup_engine.sh --fast  "
+            "(Windows: setup_engine.bat fast)." if missing
+            else "If a chosen backend is missing or unsupported on this GPU, the engine falls back to sdpa.")
 
     def save(self):
         self.apply()

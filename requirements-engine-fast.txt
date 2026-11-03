@@ -1,0 +1,6 @@
+# Optional fast attention backends for the engine (Settings > Attention).
+# Install with: ./setup_engine.sh --fast   (Windows: setup_engine.bat fast)
+#   ck_int8  - comfy-kitchen INT8 attention, ~2.7x faster than sdpa on an RTX 5090
+#   sageattn - SageAttention 1, ~1.8x faster than sdpa
+comfy-kitchen==0.2.34
+sageattention==1.0.6

@@ -42,6 +42,7 @@ def native_canvas(ratio: float, short_edge: int = 768, long_cap: int = 1344) -> 
 # attention backends the engine supports: mode -> (package, description); sdpa needs nothing extra
 ATTENTION_BACKENDS = {
     "sdpa": (None, "PyTorch SDPA (default, exact)"),
+    "ck_int8": ("comfy_kitchen", "comfy-kitchen INT8 (fastest; same seed gives different details)"),
     "sageattn": ("sageattention", "SageAttention (faster; same seed gives different details)"),
     "flash": ("flash_attn", "FlashAttention 2"),
     "flash3": ("flash_attn_interface", "FlashAttention 3 (Hopper)"),
