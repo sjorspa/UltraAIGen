@@ -196,6 +196,7 @@ These figures were measured on an RTX 5090 with 16 DiT blocks swapped.
 | Same, next video with models loaded (new seed) | **~15 s** |
 | 1344×768, 5 s, turbo LoRA, 4 steps, sampling only | 105 s with `sdpa`, **79 s with `sageattn`** |
 | 1344×768, 15 s (maximum), turbo LoRA, 4 steps | ~10 min (about 2 min per step) with `sdpa` |
+| 1344×768, long video, turbo LoRA, 8 steps | 2400 s with `sdpa`, **864 s with `sageattn`** (2.8× faster) |
 
 With models loaded, the next video skips loading the transformer (about 12 s). If the prompt is unchanged, it also skips the text encoder (about 20 s).
 
